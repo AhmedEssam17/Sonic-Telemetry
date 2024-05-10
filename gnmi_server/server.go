@@ -26,6 +26,8 @@ import (
 	"sync"
 )
 
+var InterfaceTags bool = false
+
 var (
 	supportedEncodings = []gnmipb.Encoding{gnmipb.Encoding_JSON, gnmipb.Encoding_JSON_IETF}
 )
@@ -312,7 +314,15 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 	if err != nil {
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
-	notifications := make([]*gnmipb.Notification, len(paths))
+
+	var notifications []*gnmipb.Notification
+
+	if InterfaceTags {
+		notifications = make([]*gnmipb.Notification, len(paths) - 1)
+	} else {
+		notifications = make([]*gnmipb.Notification, len(paths))
+	}
+
 	spbValues, err := dc.Get(nil)
 	if err != nil {
 		return nil, status.Error(codes.NotFound, err.Error())
@@ -324,12 +334,15 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 			Val:  spbValue.GetVal(),
 		}
 
+		if InterfaceTags {
+			notifications = append(notifications, nil)
+		}
+
 		notifications[index] = &gnmipb.Notification{
 			Timestamp: spbValue.GetTimestamp(),
 			Prefix:    prefix,
 			Update:    []*gnmipb.Update{update},
 		}
-		index++
 	}
 	return &gnmipb.GetResponse{Notification: notifications}, nil
 }

@@ -537,6 +537,21 @@ func lookupV2R(paths []string) ([]tablePath, error) {
 	return nil, fmt.Errorf("%v not found in virtual path tree", paths)
 }
 
+func ExtractPortNames() ([]string, error) {
+
+	var portNames []string
+	err := initCountersPortNameMap()
+	if err != nil {
+		return portNames, err
+	}
+	
+	for port, _ := range countersPortNameMap {
+		portNames = append(portNames, port)
+	}
+	return portNames, nil
+}
+
+
 func init() {
 	v2rTrie = NewTrie()
 	v2rTrie.v2rTriePopulate()

@@ -21,6 +21,8 @@ import (
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 )
 
+var InterfaceTags bool
+
 const (
 	// indentString represents the default indentation string used for
 	// JSON. Two spaces are used here.
@@ -176,7 +178,11 @@ func (c *DbClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *sync
 			if subMode == gnmipb.SubscriptionMode_SAMPLE {
 				c.w.Add(1)      // wait group to indicate the streaming session is complete.
 				c.synced.Add(1) // wait group to indicate whether sync_response is sent.
-				go streamSampleSubscription(c, sub, subscribe.GetUpdatesOnly())
+				if InterfaceTags {
+					go streamSampleSubscriptionTags(c, sub, subscribe.GetUpdatesOnly())
+				} else {
+					go streamSampleSubscription(c, sub, subscribe.GetUpdatesOnly())
+				}
 			} else if subMode == gnmipb.SubscriptionMode_ON_CHANGE {
 				c.w.Add(1)
 				c.synced.Add(1)
@@ -242,6 +248,37 @@ func streamSampleSubscription(c *DbClient, sub *gnmipb.Subscription, updateOnly 
 		}
 	} else {
 		dbTableKeySubscribe(c, gnmiPath, samplingInterval, updateOnly)
+	}
+}
+
+func streamSampleSubscriptionTags(c *DbClient, sub *gnmipb.Subscription, updateOnly bool) {
+	samplingInterval, err := validateSampleInterval(sub)
+	if err != nil {
+		enqueueFatalMsg(c, err.Error())
+		c.synced.Done()
+		c.w.Done()
+		return
+	}
+	path := sub.GetPath()
+	log.V(2).Infof("streamOnChangeSubscription gnmiPath: %v", path)
+
+	for _, elem := range path.GetElem() {
+		if strings.Contains(elem.GetName(), "*") {
+			for gnmiPath, tblPaths := range c.pathG2S{
+				c.w.Add(1)
+				c.synced.Add(1)
+				if tblPaths[0].field != "" {
+					if len(tblPaths) > 1 {
+						go dbFieldMultiSubscribe(c, gnmiPath, false, samplingInterval, updateOnly)
+					} else {
+						go dbFieldSubscribe(c, gnmiPath, false, samplingInterval)
+					}
+				} else {
+					go dbTableKeySubscribe(c, gnmiPath, samplingInterval, updateOnly)
+				}
+			}
+			return
+		}
 	}
 }
 
@@ -460,7 +497,12 @@ func gnmiFullPath(prefix, path *gnmipb.Path) *gnmipb.Path {
 
 func populateAllDbtablePath(prefix *gnmipb.Path, paths []*gnmipb.Path, pathG2S *map[*gnmipb.Path][]tablePath) error {
 	for _, path := range paths {
-		err := populateDbtablePath(prefix, path, pathG2S)
+		var err error
+		if InterfaceTags {
+			err = populateDbtablePathTags(prefix, path, pathG2S)
+		} else {
+			err = populateDbtablePath(prefix, path, pathG2S)
+		}
 		if err != nil {
 			return err
 		}
@@ -613,6 +655,219 @@ func populateDbtablePath(prefix, path *gnmipb.Path, pathG2S *map[*gnmipb.Path][]
 	log.V(5).Infof("tablePath %+v", tblPath)
 	return nil
 }
+
+func ClonePath(path *gnmipb.Path) *gnmipb.Path {
+    if path == nil {
+        return nil
+    }
+
+    // Create a new instance of gnmipb.Path
+    newPath := &gnmipb.Path{}
+
+    if path.Element != nil {
+        newPath.Element = make([]string, len(path.Element))
+        copy(newPath.Element, path.Element)
+    }
+
+    // Copy the elements from the original path
+    if path.Elem != nil {
+        newPath.Elem = make([]*gnmipb.PathElem, len(path.Elem))
+        for i, elem := range path.Elem {
+            // Create a new instance of gnmipb.PathElem for each element
+            newElem := &gnmipb.PathElem{}
+            if elem != nil {
+                // Copy the name and key of the original element
+                newElem.Name = elem.Name
+                if elem.Key != nil {
+                    newElem.Key = make(map[string]string)
+                    for k, v := range elem.Key {
+                        newElem.Key[k] = v
+                    }
+                }
+            }
+            newPath.Elem[i] = newElem
+        }
+    }
+
+    return newPath
+}
+
+
+func populateDbtablePathTags(prefix, path *gnmipb.Path, pathG2S *map[*gnmipb.Path][]tablePath) error {
+
+	for _, elem := range path.GetElem() {
+		if strings.Contains(elem.GetName(), "*") {
+			wildcardName := elem.GetName()
+			specificElements, err := ExtractPortNames()
+			if err != nil {
+				return err
+			}
+
+			for _, specificElem := range specificElements {
+				specificPath := ClonePath(path)
+				for _, pathElem := range specificPath.GetElem() {
+					if pathElem.GetName() == wildcardName {
+						pathElem.Name = specificElem
+					}
+				}
+
+				if len(specificPath.Element) > 0 {
+					specificPath.Element = specificPath.Element[:len(specificPath.Element)-1]
+				}
+
+				specificPath.Element = append(specificPath.Element, specificElem)
+
+				if err := populateDbtablePathTags(prefix, specificPath, pathG2S); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
+	var buffer bytes.Buffer
+	var dbPath string
+	var tblPath tablePath
+
+	target := prefix.GetTarget()
+	targetDbName, targetDbNameValid, targetDbNameSpace, targetDbNameSpaceExist := IsTargetDb(target)
+	// Verify it is a valid db name
+	if !targetDbNameValid {
+		return fmt.Errorf("Invalid target dbName %v", targetDbName)
+	}
+
+	// Verify Namespace is valid
+	dbNamespace, ok := sdcfg.GetDbNamespaceFromTarget(targetDbNameSpace)
+	if !ok {
+		return fmt.Errorf("Invalid target dbNameSpace %v", targetDbNameSpace)
+	}
+
+	if targetDbName == "COUNTERS_DB" {
+		err := initCountersPortNameMap()
+		if err != nil {
+			return err
+		}
+		err = initCountersQueueNameMap()
+		if err != nil {
+			return err
+		}
+		err = initAliasMap()
+		if err != nil {
+			return err
+		}
+		err = initCountersPfcwdNameMap()
+		if err != nil {
+			return err
+		}
+	}
+
+	fullPath := path
+	if prefix != nil {
+		fullPath = gnmiFullPath(prefix, path)
+	}
+
+	stringSlice := []string{targetDbName}
+	separator, _ := GetTableKeySeparator(targetDbName, dbNamespace)
+	elems := fullPath.GetElem()
+	if elems != nil {
+		for i, elem := range elems {
+			// TODO: Usage of key field
+			log.V(6).Infof("index %d elem : %#v %#v", i, elem.GetName(), elem.GetKey())
+			if i != 0 {
+				buffer.WriteString(separator)
+			}
+			buffer.WriteString(elem.GetName())
+			stringSlice = append(stringSlice, elem.GetName())
+		}
+		dbPath = buffer.String()
+	}
+
+	// First lookup the Virtual path to Real path mapping tree
+	// The path from gNMI might not be real db path
+	if tblPaths, err := lookupV2R(stringSlice); err == nil {
+		if targetDbNameSpaceExist {
+			return fmt.Errorf("Target having %v namespace is not supported for V2R Dataset", dbNamespace)
+		}
+		(*pathG2S)[path] = tblPaths
+		log.V(5).Infof("v2r from %v to %+v ", stringSlice, tblPaths)
+		return nil
+	} else {
+		log.V(5).Infof("v2r lookup failed for %v %v", stringSlice, err)
+	}
+	tblPath.dbNamespace = dbNamespace
+	tblPath.dbName = targetDbName
+	tblPath.tableName = stringSlice[1]
+	tblPath.delimitor = separator
+
+	var mappedKey string
+	if len(stringSlice) > 2 { // tmp, to remove mappedKey
+		mappedKey = stringSlice[2]
+	}
+
+	redisDb, ok := Target2RedisDb[tblPath.dbNamespace][tblPath.dbName]
+	if !ok {
+		return fmt.Errorf("Redis Client not present for dbName %v dbNamespace %v", targetDbName, dbNamespace)
+	}
+
+	// The expect real db path could be in one of the formats:
+	// <1> DB Table
+	// <2> DB Table Key
+	// <3> DB Table Field
+	// <4> DB Table Key Field
+	// <5> DB Table Key Key Field
+	switch len(stringSlice) {
+	case 2: // only table name provided
+		res, err := redisDb.Keys(tblPath.tableName + "*").Result()
+		if err != nil || len(res) < 1 {
+			log.V(2).Infof("Invalid db table Path %v %v", target, dbPath)
+			return fmt.Errorf("Failed to find %v %v %v %v", target, dbPath, err, res)
+		}
+		tblPath.tableKey = ""
+	case 3: // Third element could be table key; or field name in which case table name itself is the key too
+		n, err := redisDb.Exists(tblPath.tableName + tblPath.delimitor + mappedKey).Result()
+		if err != nil {
+			return fmt.Errorf("redis Exists op failed for %v", dbPath)
+		}
+		if n == 1 {
+			tblPath.tableKey = mappedKey
+		} else {
+			tblPath.field = mappedKey
+		}
+	case 4: // Fourth element could part of the table key or field name
+		tblPath.tableKey = mappedKey + tblPath.delimitor + stringSlice[3]
+		// verify whether this key exists
+		key := tblPath.tableName + tblPath.delimitor + tblPath.tableKey
+		n, err := redisDb.Exists(key).Result()
+		if err != nil {
+			return fmt.Errorf("redis Exists op failed for %v", dbPath)
+		}
+		if n != 1 { // Looks like the Fourth slice is not part of the key
+			tblPath.tableKey = mappedKey
+			tblPath.field = stringSlice[3]
+		}
+	case 5: // both third and fourth element are part of table key, fourth element must be field name
+		tblPath.tableKey = mappedKey + tblPath.delimitor + stringSlice[3]
+		tblPath.field = stringSlice[4]
+	default:
+		log.V(2).Infof("Invalid db table Path %v", dbPath)
+		return fmt.Errorf("Invalid db table Path %v", dbPath)
+	}
+
+	var key string
+	if tblPath.tableKey != "" {
+		key = tblPath.tableName + tblPath.delimitor + tblPath.tableKey
+		n, _ := redisDb.Exists(key).Result()
+		if n != 1 {
+			log.V(2).Infof("No valid entry found on %v with key %v", dbPath, key)
+			return fmt.Errorf("No valid entry found on %v with key %v", dbPath, key)
+		}
+	}
+
+	(*pathG2S)[path] = []tablePath{tblPath}
+	log.V(5).Infof("tablePath %+v", tblPath)
+	return nil
+}
+
 
 // makeJSON renders the database Key op value_pairs to map[string]interface{} for JSON marshall.
 func makeJSON_redis(msi *map[string]interface{}, key *string, op *string, mfv map[string]string) error {

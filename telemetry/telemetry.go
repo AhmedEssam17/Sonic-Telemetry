@@ -6,11 +6,11 @@ import (
 	"flag"
 	"io/ioutil"
 	"time"
-
 	log "github.com/golang/glog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-
+	
+	sdc "github.com/Azure/sonic-telemetry/sonic_data_client"
 	gnmi "github.com/Azure/sonic-telemetry/gnmi_server"
 	testcert "github.com/Azure/sonic-telemetry/testdata/tls"
 )
@@ -27,12 +27,12 @@ var (
 	allowNoClientCert = flag.Bool("allow_no_client_auth", false, "When set, telemetry server will request but not require a client certificate.")
 	jwtRefInt         = flag.Uint64("jwt_refresh_int", 900, "Seconds before JWT expiry the token can be refreshed.")
 	jwtValInt         = flag.Uint64("jwt_valid_int", 3600, "Seconds that JWT token is valid for.")
+	interfaceTags     = flag.Bool("int_tags", false, "Use interface tag names for Ethernet*.")
 )
 
 func main() {
 	flag.Var(userAuth, "client_auth", "Client auth mode(s) - none,cert,password")
 	flag.Parse()
-
 	var defUserAuth gnmi.AuthTypes
 	if gnmi.READ_WRITE_MODE {
 		//In read/write mode we want to enable auth by default.
@@ -47,6 +47,11 @@ func main() {
                 log.V(1).Infof("client_auth not provided, using defaults.")
                 userAuth = defUserAuth
         }
+
+	if isFlagPassed("int_tags") {
+		gnmi.InterfaceTags = *interfaceTags
+		sdc.InterfaceTags = *interfaceTags
+	}
 
 	switch {
 	case *port <= 0:
